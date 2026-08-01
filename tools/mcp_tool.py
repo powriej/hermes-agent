@@ -2493,13 +2493,35 @@ class MCPServerTask:
                     # sweep needs the pgid to reach any reparented descendants
                     # (e.g. ``claude mcp serve`` spawned by a stdio wrapper).
                     new_pgids: Dict[int, int] = {}
+                    # Never record our OWN process group. _filter_mcp_children
+                    # is a denylist of known non-MCP children (slash_worker,
+                    # LSP); an unrecognised child that raced into the snapshot
+                    # window and lacks start_new_session still carries the
+                    # gateway's pgid, and the shutdown sweep's killpg() would
+                    # then signal Hermes itself — the exact outcome that
+                    # function's docstring calls catastrophic. Refusing the
+                    # value here makes it structurally impossible instead of
+                    # dependent on the denylist staying complete. A tracked
+                    # PID with no pgid is still force-killed individually.
+                    try:
+                        _own_pgid = os.getpgid(0)
+                    except (AttributeError, OSError):
+                        _own_pgid = None  # Windows: os.getpgid is POSIX-only
                     for _pid in new_pids:
                         try:
-                            new_pgids[_pid] = os.getpgid(_pid)
+                            _child_pgid = os.getpgid(_pid)
                         except (AttributeError, ProcessLookupError, OSError):
                             # AttributeError: Windows (os.getpgid is POSIX-only)
                             # ProcessLookupError: child raced and already exited
-                            pass
+                            continue
+                        if _own_pgid is not None and _child_pgid == _own_pgid:
+                            logger.warning(
+                                "MCP child %s shares this process's group (%s) — "
+                                "not tracking its pgid; killpg would signal Hermes",
+                                _pid, _child_pgid,
+                            )
+                            continue
+                        new_pgids[_pid] = _child_pgid
                     with _lock:
                         for _pid in new_pids:
                             _stdio_pids[_pid] = self.name
