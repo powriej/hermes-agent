@@ -39,6 +39,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -622,6 +623,49 @@ def _read_shell_token(command: str, start: int) -> tuple[str, int]:
     return command[start:i], i
 
 
+# sudo options that consume a following argument, so a token scan doesn't
+# mistake the argument for the command sudo is being asked to run.
+_SUDO_VALUE_OPTS = frozenset(
+    ("-p", "-u", "-g", "-h", "-C", "-D", "-R", "-T", "-U", "-r", "-t")
+)
+
+
+def _sudo_will_not_prompt(command: str) -> bool:
+    """True when a ``sudo`` word in ``command`` carries ``-n``/``--non-interactive``.
+
+    Those flags make sudo fail rather than prompt, so it never reads the
+    password line from stdin — and because that line sits on the *shell's*
+    stdin, whatever runs next reads it instead (``sudo -n true; cat`` echoes it
+    straight back). Scanned on the ORIGINAL command, before the ``-S -p ''``
+    rewrite adds options of our own. Only sudo's own option cluster is
+    inspected, so ``sudo apt-get install -n foo`` (where ``-n`` belongs to
+    apt-get) is correctly ignored.
+    """
+    try:
+        # shlex so a quoted option value (`sudo -p 'pw: ' -n ...`) stays one
+        # token; a naive split would leave a stray quote that reads as the
+        # child command and hide the -n behind it.
+        tokens = shlex.split(command)
+    except ValueError:  # unbalanced quotes — fall back rather than crash
+        tokens = command.split()
+    for idx, token in enumerate(tokens):
+        if token.strip("(){};&|") != "sudo":
+            continue
+        i = idx + 1
+        while i < len(tokens):
+            opt = tokens[i]
+            if not opt.startswith("-"):
+                break  # sudo's own options ended; this is the child command
+            if opt == "--non-interactive" or (
+                len(opt) > 1 and not opt.startswith("--") and "n" in opt[1:]
+            ):
+                return True
+            if opt in _SUDO_VALUE_OPTS:
+                i += 1  # skip the option's argument
+            i += 1
+    return False
+
+
 def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
     """Rewrite only real unquoted sudo command words, not plain text mentions.
 
@@ -988,7 +1032,17 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     # inherit host sudo state. Re-probes every call (no process-lifetime
     # cache) so an expired sudo timestamp doesn't make a later command block
     # silently without Hermes prompting.
-    if not has_configured_password and not sudo_password and _sudo_nopasswd_works():
+    #
+    # The probe runs even when SUDO_PASSWORD is configured. sudo_stdin lands on
+    # the SHELL's stdin, not sudo's — every pipeline member can read it — so it
+    # is only safe to emit when sudo will actually consume the line. When sudo
+    # will not prompt (NOPASSWD, or a live sudo timestamp) the line is left
+    # unread and the next reader in the command echoes the operator's password
+    # into tool output, the model's context, and the transcript. SUDO_PASSWORD
+    # is deliberately scrubbed from the child environment
+    # (environments/local.py::_build_provider_env_blocklist), so handing it back
+    # over stdin defeats that scrubbing.
+    if _sudo_nopasswd_works():
         return command, None
 
     has_sudo_prompt_callback = _get_sudo_password_callback() is not None
@@ -1001,6 +1055,14 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
             _set_cached_sudo_password(sudo_password)
 
     if has_configured_password or sudo_password:
+        # `sudo -n` means "never prompt, fail instead", so sudo reads nothing
+        # from stdin and the password line falls through to whatever runs next
+        # (`sudo -n true; cat` hands it straight back as command output). No
+        # probe can catch this — it is a property of the command the model
+        # wrote, not of host sudo state — so refuse to inject and let sudo fail
+        # gracefully, exactly as it does with no password configured.
+        if _sudo_will_not_prompt(command):
+            return command, None
         # Trailing newline is required: sudo -S reads one line per invocation.
         # Compound commands (`sudo a && sudo b`) need one password line each.
         password_line = sudo_password + "\n"
