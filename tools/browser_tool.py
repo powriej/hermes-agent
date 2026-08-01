@@ -57,6 +57,7 @@ import os
 import re
 import subprocess
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -1797,6 +1798,31 @@ def _reap_orphaned_browser_sessions():
 
     reaped = 0
     for socket_dir in socket_dirs:
+        # Ownership gate, before anything in this directory is trusted.
+        #
+        # The reaper reads a PID out of a file here and terminates that PID's
+        # whole process tree. The directory lives in a world-writable temp dir,
+        # and a daemon that predates the owner_pid convention is treated as
+        # "legacy" (reapable) rather than as untrusted — so any local user who
+        # can mkdir in /tmp could name the PID Hermes kills. Skip anything this
+        # uid does not own, and never follow a symlink into somewhere else.
+        # Directories Hermes created are unaffected: it owns them.
+        # os.getuid is POSIX-only; on Windows the per-user temp dir already
+        # provides the separation this check is for, so the uid comparison is
+        # simply skipped there (the symlink check still applies).
+        _getuid = getattr(os, "getuid", None)
+        try:
+            st = os.lstat(socket_dir)
+            if stat.S_ISLNK(st.st_mode) or (
+                _getuid is not None and st.st_uid != _getuid()
+            ):
+                logger.debug(
+                    "Skipping browser socket dir not owned by this uid: %s", socket_dir
+                )
+                continue
+        except OSError:
+            continue
+
         dir_name = os.path.basename(socket_dir)
         # dir_name is "agent-browser-{session_name}"
         session_name = dir_name.removeprefix("agent-browser-")

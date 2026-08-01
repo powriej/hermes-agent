@@ -355,3 +355,64 @@ class TestEmergencyCleanupRunsReaper:
         assert reaper_called, (
             "Reaper must run on exit even with no active sessions"
         )
+
+
+class TestSocketDirOwnership:
+    """The reaper reads a PID from a file in a world-writable temp dir and
+    terminates that PID's whole process tree. A directory without an
+    ``.owner_pid`` file is treated as a legacy daemon and reaped, so without an
+    ownership gate any local user who can create a directory there chooses the
+    PID Hermes kills.
+    """
+
+    def test_foreign_owned_socket_dir_is_not_reaped(self, fake_tmpdir):
+        import tools.browser_tool as bt
+
+        # A legacy-looking dir (no .owner_pid) with a live PID — the shape the
+        # reaper would otherwise kill.
+        _make_socket_dir(fake_tmpdir, "h_deadbeef01", pid=12345)
+
+        real_lstat = os.lstat
+
+        def _foreign(path, *a, **kw):
+            st = real_lstat(path, *a, **kw)
+            if "agent-browser-" in str(path):
+                # Same directory, but owned by a different uid.
+                return os.stat_result(
+                    (st.st_mode, st.st_ino, st.st_dev, st.st_nlink,
+                     st.st_uid + 1, st.st_gid, st.st_size,
+                     int(st.st_atime), int(st.st_mtime), int(st.st_ctime))
+                )
+            return st
+
+        # Every other gate is forced open, so the ownership check is the only
+        # thing that can prevent the kill. Without those patches this test
+        # would pass on _verify_reapable_browser_daemon instead and prove
+        # nothing about ownership.
+        with patch("tools.browser_tool.os.lstat", side_effect=_foreign), \
+             patch("gateway.status._pid_exists", return_value=True), \
+             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
+             patch("tools.process_registry.ProcessRegistry._terminate_host_pid") as kill:
+            bt._reap_orphaned_browser_sessions()
+
+        assert not kill.called, "reaped a socket dir owned by another uid"
+
+    def test_own_socket_dir_is_still_reaped(self, fake_tmpdir):
+        """The guard must not stop Hermes reaping its own orphans.
+
+        Same setup as test_alive_legacy_daemon_is_reaped — the ownership gate
+        is the only thing under test here.
+        """
+        import tools.browser_tool as bt
+
+        d = _make_socket_dir(fake_tmpdir, "h_deadbeef02", pid=12345)
+        terminate_calls = []
+
+        with patch("gateway.status._pid_exists", return_value=True), \
+             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
+             patch("tools.process_registry.ProcessRegistry._terminate_host_pid",
+                   side_effect=terminate_calls.append):
+            bt._reap_orphaned_browser_sessions()
+
+        assert 12345 in terminate_calls, "own orphaned daemon was not reaped"
+        assert not d.exists()
