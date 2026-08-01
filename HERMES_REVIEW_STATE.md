@@ -58,14 +58,37 @@ Now gated on `not is_gateway and not is_ask`. Real standalone cron is unchanged.
 - **HCR-009** (untrusted-result fence): the `startswith` fail-open guard no longer exists in
   that form. Needs fresh derivation if still wanted — not a port.
 
-### Still outstanding (not re-derived)
+### The remaining five — re-derived and fixed (2026-08-01)
 
-HCR-010 token accounting on truncated responses · HCR-012 MCP stdio PID misattribution ·
-HCR-013 browser reaper trusting attacker-writable temp state · HCR-014 max-iteration
-scaffolding persisting into the next turn · HCR-016 steer scan crossing a turn boundary.
+All five were re-derived at `15cb86eba`; all five still existed. Four are fixed:
 
-All cite `b5f8996cc` line numbers. Given how much upstream fixed independently, re-derive
-before writing any code against them.
+| Commit | Finding | Fix |
+|---|---|---|
+| `29e0b25fb` | HCR-013 | Browser reaper skips socket dirs this uid doesn't own (and symlinks). Upstream had already added `_verify_reapable_browser_daemon` ("is this PID a browser daemon"); this adds "is this directory even ours", which that cannot answer. |
+| `56a68c0af` | HCR-014 | Iteration-summary request flagged `_iteration_summary_request` so it never reaches the durable transcript. |
+| `26c544096` | HCR-016 | Steer scan bounded at `current_turn_user_idx`, so it can no longer rewrite a previous turn's tool result or invalidate the cache prefix. |
+| `c36d87bd6` | HCR-012 | MCP refuses to record a stdio child's pgid when it equals `os.getpgid(0)`. Upstream's `_filter_mcp_children` is a denylist; this makes the "killpg signals Hermes itself" case structurally impossible instead of dependent on that list staying complete. |
+
+**HCR-010 (token accounting on truncated responses) — NOT FIXED, deliberately.**
+
+The defect is real and re-confirmed: the three `finish_reason == "length"` exits
+(`agent/conversation_loop.py:2961`, `:3032`, `:3083`) all precede the only site that
+increments session token counters (`:3241-3250`), so truncated responses — typically the
+largest completions, since they hit the output cap — contribute nothing to totals, cost
+estimates, or the session DB.
+
+It is not fixed because the minimal correct fix is not small. `canonical_usage` is not
+normalized until `:3148`, *after* the length branch, so the accounting cannot simply be
+hoisted — normalization has to move with it, inside the hottest path of a ~7,000-line
+function, touching streaming and provider-fallback interactions that this review explicitly
+never assessed (see "not assessed" in the coverage notes). The payoff is analytics accuracy:
+no data loss, no correctness impact, no security impact. That risk/benefit does not justify
+an under-validated refactor of the core loop.
+
+**For whoever picks it up:** either hoist normalization + accounting above `:2823`, or
+extract the accounting into a helper and call it at each of the three exits. Either way it
+needs streaming and provider-fallback coverage that does not exist today, and a test
+asserting the same response is not counted twice across the continuation retry.
 
 ---
 
