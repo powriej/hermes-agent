@@ -1399,7 +1399,18 @@ def run_conversation(
         _pre_api_steer = agent._drain_pending_steer()
         if _pre_api_steer:
             _injected = False
-            for _si in range(len(messages) - 1, -1, -1):
+            # Stop at this turn's user message. The scan used to run to index 0,
+            # so on an iteration with no fresh tool batch (e.g. re-entering the
+            # loop after a length-truncation continuation, when the previous
+            # turn ended on a tool tail) it reached back and rewrote a tool
+            # result from an EARLIER turn: the steer lands in stale history
+            # where the model won't act on it, and already-sent context is
+            # mutated mid-conversation, invalidating the prompt-cache prefix
+            # (AGENTS.md: "Do NOT alter past context mid-conversation").
+            # Falling through to the put-back below keeps the steer pending for
+            # the next real tool batch instead.
+            _steer_floor = max(0, current_turn_user_idx)
+            for _si in range(len(messages) - 1, _steer_floor - 1, -1):
                 _sm = messages[_si]
                 if isinstance(_sm, dict) and _sm.get("role") == "tool":
                     from agent.prompt_builder import format_steer_marker
