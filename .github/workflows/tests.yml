@@ -134,6 +134,16 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
 
+      # Give each slice a distinct FILENAME, not just a distinct artifact name.
+      # The merge job downloads with merge-multiple, which flattens every
+      # artifact into one directory — identically-named files then overwrite
+      # each other and only the last slice's timings survive, so the cache
+      # converges ~6x slower than intended and slices stay unbalanced.
+      - name: Name the durations file after this slice
+        if: always()
+        run: mv test_durations.json test_durations-${{ matrix.slice.index }}.json
+        continue-on-error: true
+
       - name: Upload per-slice durations
         # Advisory artifact (feeds slice balancing) — a transient artifact-
         # service blip must not fail an otherwise-green test slice.
@@ -141,7 +151,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-durations-slice-${{ matrix.slice.index }}
-          path: test_durations.json
+          path: test_durations-${{ matrix.slice.index }}.json
           retention-days: 1
 
   # Merge per-slice duration data into a single cache, so future runs
@@ -164,7 +174,11 @@ jobs:
           python3 -c "
           import json, glob, os
           merged = {}
-          for f in glob.glob('durations/*test_durations.json'):
+          # Widened alongside the per-slice rename above: the old
+          # '*test_durations.json' pattern does not match
+          # 'test_durations-<i>.json', so renaming without this would silently
+          # merge nothing.
+          for f in glob.glob('durations/*.json'):
             with open(f) as fh:
               merged.update(json.load(fh))
           with open('test_durations.json', 'w') as fh:
