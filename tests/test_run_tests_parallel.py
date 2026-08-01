@@ -378,3 +378,60 @@ def test_explicit_k_wins_over_node_id_inference(tmp_path: Path) -> None:
     # -k test_beta wins: one test ran, and it wasn't filtered to nothing.
     assert proc.returncode == 0, proc.stdout
     assert "1 tests passed" in proc.stdout
+
+
+def _make_marker_probe(tmp_path: Path) -> Path:
+    """A probe that records the pytest argv it was launched with.
+
+    Recording argv (rather than checking whether a marked test got deselected)
+    is what makes this hermetic: a probe under tmp_path makes pytest resolve
+    rootdir to the temp tree, so the repo's ``addopts = -m 'not integration'``
+    never applies there and a behavioural assertion would pass for the wrong
+    reason.
+    """
+    probe_dir = tmp_path / "integration"
+    probe_dir.mkdir()
+    (probe_dir / "test_markerprobe.py").write_text(
+        "import pathlib, sys\n\n"
+        "def test_record_argv():\n"
+        "    pathlib.Path(__file__).with_name('argv.txt').write_text(' '.join(sys.argv))\n"
+    )
+    return probe_dir
+
+
+def _recorded_argv(probe_dir: Path) -> str:
+    recorded = probe_dir / "argv.txt"
+    assert recorded.exists(), "probe did not run"
+    return recorded.read_text()
+
+
+def test_include_integration_injects_a_marker_override(tmp_path: Path) -> None:
+    """--include-integration must defeat the addopts marker filter.
+
+    Clearing ``_SKIP_PARTS`` only lifts the directory skip; pyproject still
+    carries ``-m 'not integration'`` and every file under tests/integration/ is
+    module-level marked, so the flag discovered those files and then deselected
+    every test in them — "0 tests passed", exit 1, suites dark.
+    """
+    probe_dir = _make_marker_probe(tmp_path)
+    _run_runner(probe_dir, "--include-integration")
+
+    assert "integration or not integration" in _recorded_argv(probe_dir)
+
+
+def test_no_marker_override_without_the_flag(tmp_path: Path) -> None:
+    """A default run must not start injecting marker expressions."""
+    probe_dir = _make_marker_probe(tmp_path)
+    _run_runner(probe_dir)
+
+    assert "-m" not in _recorded_argv(probe_dir).split()
+
+
+def test_caller_marker_expression_is_not_overridden(tmp_path: Path) -> None:
+    """An explicit -m from the caller wins over the flag's injected default."""
+    probe_dir = _make_marker_probe(tmp_path)
+    _run_runner(probe_dir, "--include-integration", "-m", "not integration")
+
+    argv = _recorded_argv(probe_dir)
+    assert "not integration" in argv
+    assert "integration or not integration" not in argv

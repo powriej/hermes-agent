@@ -899,6 +899,19 @@ def main() -> int:
             # Caller takes responsibility — typically used via explicit -k filter.
             global _SKIP_PARTS  # noqa: PLW0603 — config knob
             _SKIP_PARTS = set()
+            # Clearing the directory skip list is only half the job: pyproject's
+            # ``addopts`` also carries ``-m 'not integration'``, and every file
+            # under tests/integration/ is module-level marked. Without a marker
+            # override the flag discovers those files, deselects every test in
+            # them, and reports "0 tests passed" (exit 1, "no tests ran") — the
+            # suites it exists to run stay dark. A command-line ``-m`` wins over
+            # addopts; the tautology re-enables the integration lane without
+            # excluding anything else, so mixed roots still behave.
+            if not any(a == "-m" or a.startswith("-m=") for a in pytest_passthrough):
+                pytest_passthrough = pytest_passthrough + [
+                    "-m",
+                    "integration or not integration",
+                ]
 
         files = _discover_files(roots)
 
