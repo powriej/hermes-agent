@@ -2099,7 +2099,12 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         "Please provide a final response summarizing what you've found and accomplished so far, "
         "without calling any more tools."
     )
-    messages.append({"role": "user", "content": summary_request})
+    # Flagged so the scaffolding stripper can drop it when the summary call
+    # fails and leaves it as the transcript tail; see
+    # _EPHEMERAL_SCAFFOLDING_FLAGS in run_agent.py.
+    messages.append(
+        {"role": "user", "content": summary_request, "_iteration_summary_request": True}
+    )
 
     try:
         # Build API messages, stripping internal-only fields

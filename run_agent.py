@@ -248,6 +248,13 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # iteration-budget summary request: a synthetic user turn asking for a
+    # wrap-up "without calling any more tools". If the summary call itself
+    # fails or returns empty, no assistant reply follows it, so it survives to
+    # persistence and repair_message_sequence then concatenates it onto the
+    # user's NEXT real message — carrying a stale stop-calling-tools
+    # instruction into a turn whose budget has reset.
+    "_iteration_summary_request",
 )
 
 
