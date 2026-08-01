@@ -413,3 +413,41 @@ class TestCronWithGatewayOrigin:
         finally:
             clear_session_vars(tokens)
 
+
+
+# ── cron policy must not capture live gateway users ─────────────────────────
+# HERMES_CRON_SESSION is set process-wide by the scheduler and never cleared,
+# and the gateway runs the cron ticker inside its own process. An unqualified
+# cron check therefore judges live-user execute_code calls by cron policy once
+# any job has fired: BLOCKED with a misleading "no user present" message under
+# the default mode, or silently auto-approved under cron_mode: approve.
+
+
+def test_gateway_user_still_prompted_after_a_cron_job_has_run(monkeypatch):
+    """A live gateway session keeps interactive approval despite the cron latch."""
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")  # gateway/run.py sets this at import
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")  # a cron job ran earlier in-process
+
+    for mode in ("deny", "approve"):
+        monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda mode=mode: mode)
+        result = approval_module.check_execute_code_guard("import os; os.system('rm -rf /tmp/x')", "local")
+        assert result.get("status") == "pending_approval", (
+            f"cron_mode={mode} hijacked a live gateway user's approval"
+        )
+        assert result["approved"] is False
+
+
+def test_standalone_cron_still_applies_cron_mode(monkeypatch):
+    """The real cron case — no gateway/ask context — is unchanged."""
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "deny")
+    denied = approval_module.check_execute_code_guard("import os", "local")
+    assert denied["approved"] is False and denied.get("status") != "pending_approval"
+
+    monkeypatch.setattr(approval_module, "_get_cron_approval_mode", lambda: "approve")
+    assert approval_module.check_execute_code_guard("import os", "local")["approved"] is True

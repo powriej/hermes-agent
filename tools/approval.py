@@ -3878,7 +3878,15 @@ def check_execute_code_guard(code: str, env_type: str,
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Cron: no user is present to approve arbitrary code.
-    if env_var_enabled("HERMES_CRON_SESSION"):
+    #
+    # Gated on there being no interactive context, matching the shell-command
+    # guards. HERMES_CRON_SESSION is process-wide and never cleared, and the
+    # gateway runs the cron ticker in its own process — so once any cron job has
+    # fired, an unqualified check here judges *live user* execute_code calls by
+    # cron policy: BLOCKED with a "no user present" message under the default
+    # cron_mode, or silently auto-approved (no prompt) under cron_mode: approve.
+    # A real cron run has neither var set and still takes this branch.
+    if env_var_enabled("HERMES_CRON_SESSION") and not is_gateway and not is_ask:
         if _get_cron_approval_mode() == "deny":
             return {
                 "approved": False,
