@@ -117,6 +117,24 @@ written for. Kept anyway, because recommending and destroying are different thin
 - **This file is untracked on purpose**, to keep session-specific notes out of a history that
   tracks upstream. It is backed up outside the repo, because the last update deleted exactly
   this kind of file. Commit it if you'd rather it survive in the fork.
-- **Upstream moves fast** — `origin/main` was already past `15cb86eba` at push time. If the P1
-  and P2 fixes should reach NousResearch rather than just the fork, they need a PR; both
-  defects still exist in upstream's tree.
+- **Upstream moves fast** — `origin/main` was already past `15cb86eba` at push time.
+
+## 5. Upstream PR — DEFERRED (operator decision, 2026-08-01)
+
+The P1 (sudo password) and P2 (cron approval) fixes live **only in this fork**. Both defects
+still exist in `NousResearch/hermes-agent`; upstreaming them was considered and **deferred**.
+
+Not an oversight — recorded so it is not re-raised as an open action. Standing facts for
+whenever it is revisited:
+
+- This fork is protected; the exposure is to other Hermes operators, not to this machine.
+- The P1 is the one with reach beyond a single user: on any host with passwordless sudo or a
+  warm sudo timestamp, a configured `SUDO_PASSWORD` is echoed into command output, and from
+  there into model context, transcripts, and logs. No malicious model is required.
+- Both fixes are self-contained, carry regression tests, and rebase cleanly in principle —
+  though upstream moves fast enough (`origin/main` was already past `15cb86eba` at push time)
+  that they will need re-verification against whatever HEAD is current at PR time.
+- SECURITY.md §3.1 classes the sudo issue as in-scope credential exfiltration ("via a mechanism
+  that should have prevented it"), so it would go through the private security channel rather
+  than a plain PR. The cron approval issue is a functional/trust-model defect, not a §3.1
+  vulnerability, and belongs in a normal PR.
