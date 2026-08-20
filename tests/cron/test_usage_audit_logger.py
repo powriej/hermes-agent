@@ -131,3 +131,75 @@ class TestWriteUsageAudit:
         scheduler._write_usage_audit({"job_id": "한글", "model": "gemma"})
         text = scheduler._usage_audit_path().read_text(encoding="utf-8")
         assert "한글" in text
+
+
+class TestServedModelFields:
+    """The requested-vs-served split.
+
+    Motivated by a real 6-day outage: deepseek-v4-flash went region-dead (HTTP 403) on
+    2026-08-11, every cron call silently fell back to Copilot, and the audit logged the
+    REQUESTED model as "ok" 153 times. Nothing recorded that a different model answered.
+    On 2026-08-17 Copilot hit its quota and every affected job failed at once.
+    """
+
+    def test_fallback_is_visible_when_a_different_model_serves(self):
+        # The exact shape of the outage: deepseek requested, Copilot actually answered.
+        fields = scheduler._served_model_fields(
+            "deepseek-v4-flash",
+            {"model": "claude-haiku-4.5", "provider": "copilot"},
+        )
+        assert fields["served_model"] == "claude-haiku-4.5"
+        assert fields["served_provider"] == "copilot"
+        assert fields["fallback_used"] is True
+
+    def test_no_fallback_when_requested_model_served(self):
+        fields = scheduler._served_model_fields(
+            "qwen3.8-max",
+            {"model": "qwen3.8-max", "provider": "opencode-go"},
+        )
+        assert fields["served_model"] == "qwen3.8-max"
+        assert fields["fallback_used"] is False
+
+    @pytest.mark.parametrize("result", [None, "not-a-dict", 42, []])
+    def test_non_dict_result_is_tolerated(self, result):
+        """The failure path can reach the audit write before a result exists.
+
+        An audit write must never be the thing that raises.
+        """
+        fields = scheduler._served_model_fields("qwen3.8-max", result)
+        assert fields["served_model"] is None
+        assert fields["served_provider"] is None
+        assert fields["fallback_used"] is False
+
+    def test_unknown_served_model_is_not_reported_as_no_fallback(self):
+        """Absence of evidence is not evidence of absence.
+
+        With no served model there is no basis to claim a fallback did NOT happen — but
+        fallback_used must stay False rather than True, because a bare claim of
+        "a fallback occurred" with nothing to name is equally unfounded. The signal that
+        something is unknown is served_model being null.
+        """
+        fields = scheduler._served_model_fields("qwen3.8-max", {"provider": "opencode-go"})
+        assert fields["served_model"] is None
+        assert fields["fallback_used"] is False
+
+    def test_missing_requested_model_does_not_claim_a_fallback(self):
+        fields = scheduler._served_model_fields(None, {"model": "qwen3.8-max"})
+        assert fields["served_model"] == "qwen3.8-max"
+        assert fields["fallback_used"] is False
+
+    def test_fields_survive_a_write_roundtrip(self, tmp_hermes_home):
+        record = {
+            "ts": "2026-08-19T04:23:11.123Z",
+            "job_id": "abc",
+            "model": "deepseek-v4-flash",
+            **scheduler._served_model_fields(
+                "deepseek-v4-flash", {"model": "claude-haiku-4.5", "provider": "copilot"}
+            ),
+        }
+        scheduler._write_usage_audit(record)
+        rows = _read_jsonl(scheduler._usage_audit_path())
+        assert len(rows) == 1
+        assert rows[0]["model"] == "deepseek-v4-flash"
+        assert rows[0]["served_model"] == "claude-haiku-4.5"
+        assert rows[0]["fallback_used"] is True

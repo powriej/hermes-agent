@@ -1219,6 +1219,36 @@ def _utcnow_iso_ms() -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
+def _served_model_fields(requested_model, result) -> dict:
+    """Split what was REQUESTED from what actually SERVED a cron turn.
+
+    ``result["model"]``/``result["provider"]`` are read off the agent after the turn, so
+    they reflect any fallback activated mid-run. The audit used to record only the
+    requested model, which is why deepseek-v4-flash — region-dead (HTTP 403) from
+    2026-08-11 — kept logging as "ok" 153 times while Copilot silently answered every
+    call. The masking only became visible on 2026-08-17 when Copilot hit its quota and
+    every affected job failed at once. ``fallback_used`` is the signal that was missing.
+
+    Defensive by design: ``result`` may be ``None`` or a non-dict on the failure path,
+    where the exception can fire before the turn ever produced one. An audit write must
+    never itself raise.
+    """
+    served_model = None
+    served_provider = None
+    if isinstance(result, dict):
+        served_model = result.get("model") or None
+        served_provider = result.get("provider") or None
+    return {
+        "served_model": served_model,
+        "served_provider": served_provider,
+        # Only a claim when BOTH are known. Absent a served model there is no evidence
+        # either way, and "unknown" must not be recorded as "no fallback happened".
+        "fallback_used": bool(
+            served_model and requested_model and served_model != requested_model
+        ),
+    }
+
+
 def _write_usage_audit(record: dict) -> None:
     """Append a single JSONL line to ~/.hermes/cron/usage_audit.jsonl.
 
@@ -5414,6 +5444,13 @@ def run_job(
         # Emit one JSONL line per fire for usage audit.
         _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
         _audit_response_silent = _is_cron_silence_response(final_response or "")
+        # ``model`` is what was REQUESTED. ``result["model"]`` is ``agent.model`` read after
+        # the turn, so it reflects any fallback the agent silently activated mid-run — i.e.
+        # what actually SERVED the request. Recording only the requested model is how a
+        # region-dead model (deepseek-v4-flash, 403 from 2026-08-11) went on being logged as
+        # "ok" 153 times while Copilot quietly answered every call, until Copilot hit its
+        # quota on 08-17 and the whole thing fell over at once. Log both, and the divergence.
+        _served = _served_model_fields(model, result)
         _write_usage_audit({
             "ts": _utcnow_iso_ms(),
             "job_id": job_id,
@@ -5424,6 +5461,7 @@ def run_job(
             "response_silent": _audit_response_silent,
             "deliver_target": job.get("deliver"),
             "model": model or None,
+            **_served,
             "duration_ms": _audit_duration_ms,
             "error": None,
         })
@@ -5437,6 +5475,10 @@ def run_job(
         # with a None check so the audit write itself never raises.
         if "_audit_fire_id" in locals():
             _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
+            # Same requested-vs-served split as the success path. ``result`` may be unbound
+            # here (the exception can fire before submit()), so read it defensively — an
+            # audit write must never be the thing that raises.
+            _f_served = _served_model_fields(model, locals().get("result"))
             _write_usage_audit({
                 "ts": _utcnow_iso_ms(),
                 "job_id": job_id,
@@ -5447,6 +5489,7 @@ def run_job(
                 "response_silent": False,
                 "deliver_target": job.get("deliver"),
                 "model": model or None,
+                **_f_served,
                 "duration_ms": _audit_duration_ms,
                 "error": error_msg,
             })
