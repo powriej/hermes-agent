@@ -241,6 +241,69 @@ def cron_runs(job_id: Optional[str] = None, limit: int = 20):
             print(f"    {record['error']}")
 
 
+def _gateway_pids_driving_this_profile(pids: list) -> list:
+    """Keep only gateway PIDs that actually drive THIS profile's cron store.
+
+    ``find_gateway_pids()`` unconditionally folds in the systemd service PIDs of
+    EVERY profile's gateway. A profile driven by an external ticker instead of a
+    gateway (offroad, 2026-08-20) was therefore told "Gateway is running" and
+    handed the johnny5 + default gateway PIDs -- gateways that drive nothing for
+    it, and whose ``--replace`` restart seizes the shared Telegram bot token and
+    round-robins the fleet. Attribute each PID by its own ``HERMES_HOME``.
+
+    Best-effort and conservative: if we cannot read /proc we return the input
+    unchanged rather than under-report.
+    """
+    import os
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        mine = os.path.realpath(str(get_hermes_home()))
+    except Exception:
+        return pids
+
+    mine_p = Path(mine)
+    if mine_p.parent.name == "profiles":
+        root = str(mine_p.parent.parent)
+        my_name = mine_p.name
+    else:
+        root, my_name = mine, None
+
+    active = ""
+    try:
+        active = (Path(root) / "active_profile").read_text().strip()
+    except Exception:
+        pass
+
+    kept = []
+    for pid in pids:
+        try:
+            raw = Path(f"/proc/{pid}/environ").read_bytes().decode("utf-8", "replace")
+        except Exception:
+            # Unreadable (not Linux, or not ours): only trust it for the root home.
+            if my_name is None:
+                kept.append(pid)
+            continue
+        env_home = ""
+        for entry in raw.split("\x00"):
+            if entry.startswith("HERMES_HOME="):
+                env_home = entry.split("=", 1)[1]
+                break
+        if not env_home:
+            if my_name is None:
+                kept.append(pid)
+            continue
+        env_home = os.path.realpath(env_home)
+        if env_home == mine:
+            kept.append(pid)              # explicitly this profile
+        elif env_home == root and my_name is not None and active == my_name:
+            kept.append(pid)              # root-home gateway resolving to us via active_profile
+        elif env_home == root and my_name is None:
+            kept.append(pid)              # we ARE the root home
+    return kept
+
+
 def cron_status():
     """Show cron execution status."""
     from cron.jobs import list_jobs
@@ -272,7 +335,7 @@ def cron_status():
         print()
         return
 
-    pids = find_gateway_pids()
+    pids = _gateway_pids_driving_this_profile(find_gateway_pids())
     if pids:
         # The gateway PROCESS is alive — but the cron ticker THREAD inside it
         # can die silently, or stay alive while every tick fails. Check both
@@ -332,6 +395,37 @@ def cron_status():
             if hb_age is not None:
                 print(f"  Ticker heartbeat: {int(hb_age)}s ago")
     else:
+        # No gateway drives THIS profile. That is the NORMAL, supported state for a
+        # profile ticked by an external systemd timer running
+        # `hermes --profile X cron tick` -- the pattern used for profiles that share
+        # a Telegram bot token, where a gateway would seize it. The heartbeat is
+        # written by whichever driver ticks the store, so trust it here rather than
+        # declaring cron dead purely because no gateway process exists.
+        from cron.jobs import (
+            get_ticker_heartbeat_age,
+            get_ticker_success_age,
+            TICKER_INTERVAL_SECONDS,
+        )
+
+        _stale_after = TICKER_INTERVAL_SECONDS * 3 + 20
+        _hb = get_ticker_heartbeat_age()
+        _ok = get_ticker_success_age()
+        if _hb is not None and _hb <= _stale_after:
+            print(color(
+                "✓ No gateway for this profile — cron is driven by an external "
+                "ticker, and it is live", Colors.GREEN,
+            ))
+            print(f"  Ticker heartbeat: {int(_hb)}s ago")
+            if _ok is not None and _ok > _stale_after:
+                print(color(
+                    f"  ⚠ but no tick has SUCCEEDED in {int(_ok)}s — ticks may be failing.",
+                    Colors.YELLOW,
+                ))
+            print()
+            _print_active_jobs_summary(list_jobs(include_disabled=False))
+            print()
+            return
+
         print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
         print()
         print("  To enable automatic execution:")
