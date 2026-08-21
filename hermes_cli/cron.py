@@ -203,7 +203,24 @@ def cron_list(show_all: bool = False):
 def cron_tick():
     """Run due jobs once and exit."""
     from cron.scheduler import tick
-    tick(verbose=True)
+    from cron.jobs import record_ticker_heartbeat
+
+    # A profile driven by an EXTERNAL ticker (e.g. a systemd timer running
+    # `hermes --profile X cron tick` every minute, the supported way to drive a
+    # profile whose gateway would seize a shared Telegram token) never enters the
+    # in-process scheduler loop in cron/scheduler_provider.py — the only other
+    # place record_ticker_heartbeat() is called. Without this write the store's
+    # ticker_heartbeat never advances, so `hermes cron status` reports a STALLED
+    # ticker forever and advises `hermes gateway restart` against a gateway that
+    # is not driving this profile at all (offroad, 2026-08-20: heartbeat frozen
+    # 12 days while its jobs ran correctly). Record liveness here so the
+    # heartbeat means "this store was ticked", whichever driver did it.
+    ok = False
+    try:
+        tick(verbose=True)
+        ok = True
+    finally:
+        record_ticker_heartbeat(success=ok)
 
 
 def cron_runs(job_id: Optional[str] = None, limit: int = 20):
