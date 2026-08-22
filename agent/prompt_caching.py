@@ -132,6 +132,49 @@ ALIBABA_FAMILY_PROVIDERS = frozenset({
 })
 
 
+# --- 1h-tier membership: an ALLOW-list, deliberately minimal ----------------
+#
+# #84733 clamped 1h -> 5m for the whole alibaba/opencode family, reasoning from
+# Alibaba's PUBLISHED Qwen docs. Wire measurement on the opencode-go route
+# contradicts the docs. Controlled run: identical request, only the ttl flag
+# varying, read back after 11 minutes with no intervening call (a read renews
+# the window and would mask expiry):
+#
+#   qwen3.8-max   ttl=1h -> cache_read 2122  SURVIVED
+#   qwen3.8-max   ttl=-  -> cache_read    0  EXPIRED    <- control
+#   glm-5.2       ttl=1h -> cache_read 2092  SURVIVED
+#   minimax-m2.5  ttl=1h -> cache_read    0  EXPIRED
+#
+# Only opencode-go is listed: it is the only route measured. Other opencode
+# routes stay clamped because they were NOT measured, not because they are
+# known bad. opencode-zen returns cache_creation.ephemeral_1h_input_tokens for
+# Claude models, so it is a candidate -- but qwen on zen is unmeasured, so
+# adding the provider wholesale would outrun the evidence.
+#
+# WARNING: opencode-go labels EVERY write `ephemeral_5m_input_tokens` whatever
+# ttl was requested. That label is NOT evidence of the retention window -- it
+# is what made the original docs-based reasoning look confirmed. Verify only
+# with a delayed read past 5 minutes and no intervening call.
+#
+# NOTE: kept separate from ALIBABA_FAMILY_PROVIDERS on purpose. That set also
+# drives the cache-marker-layout OPT-IN in
+# agent_runtime_helpers.anthropic_prompt_cache_policy; narrowing it would
+# silently DISABLE caching for qwen on opencode-go rather than extend its TTL.
+MEASURED_1H_PROVIDERS = frozenset({
+    "opencode-go",
+})
+
+# Models measured to ignore the 1h tier even on a 1h-capable route.
+NO_1H_TIER_MODELS = frozenset({
+    "minimax-m2.5",
+})
+
+
+def _flat_model(model: str) -> str:
+    """Bare model id, tolerating aggregator prefixes (``vendor/model``)."""
+    return (model or "").strip().rsplit("/", 1)[-1].lower()
+
+
 def is_qwen_model(model: str) -> bool:
     """True when ``model`` names a Qwen-family model (case-insensitive).
 
@@ -160,6 +203,10 @@ def effective_cache_ttl(
     """
     if ttl != "1h":
         return ttl or "5m"
+    if _flat_model(model) in NO_1H_TIER_MODELS:
+        return "5m"
+    if (provider or "").lower() in MEASURED_1H_PROVIDERS:
+        return "1h"
     if is_qwen_model(model):
         return "5m"
     if (provider or "").lower() in ALIBABA_FAMILY_PROVIDERS:

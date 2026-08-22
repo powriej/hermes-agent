@@ -492,9 +492,57 @@ class TestEffectiveCacheTtl:
         assert effective_cache_ttl("1h", provider="anthropic", model="Qwen-Max") == "5m"
 
     def test_1h_clamped_for_alibaba_family_providers(self):
-        for provider in ("opencode", "opencode-zen", "opencode-go", "alibaba"):
+        # opencode-go is excluded: MEASURED to honour the 1h tier, see
+        # test_1h_preserved_on_measured_opencode_go_route. The rest stay
+        # clamped because they are unmeasured, not because they are known bad.
+        for provider in ("opencode", "opencode-zen", "alibaba"):
             assert effective_cache_ttl("1h", provider=provider, model="qwen-max") == "5m", provider
             assert effective_cache_ttl("1h", provider=provider.upper(), model="claude-x") == "5m", provider
+
+    def test_1h_preserved_on_measured_opencode_go_route(self):
+        """opencode-go was MEASURED to honour the 1h tier (#84733 follow-up).
+
+        Controlled run: identical request, only the ttl flag varying, read back
+        after 11 minutes with no intervening call (a read renews the window and
+        masks expiry).
+
+            qwen3.8-max   ttl=1h -> cache_read 2122  SURVIVED
+            qwen3.8-max   ttl=-  -> cache_read    0  EXPIRED   <- control
+            glm-5.2       ttl=1h -> cache_read 2092  SURVIVED
+            minimax-m2.5  ttl=1h -> cache_read    0  EXPIRED
+
+        NB the provider labels every write ``ephemeral_5m_input_tokens``
+        regardless of the ttl requested; that label is not evidence of the
+        retention window.
+        """
+        assert effective_cache_ttl("1h", provider="opencode-go", model="qwen3.8-max") == "1h"
+        assert effective_cache_ttl("1h", provider="opencode-go", model="glm-5.2") == "1h"
+
+    def test_1h_clamped_for_measured_no_1h_model_even_on_allowed_route(self):
+        assert effective_cache_ttl("1h", provider="opencode-go", model="minimax-m2.5") == "5m"
+        # aggregator-prefixed spelling resolves to the same bare id
+        assert effective_cache_ttl("1h", provider="opencode-go", model="vendor/MiniMax-M2.5") == "5m"
+
+    def test_unmeasured_opencode_routes_stay_clamped(self):
+        # Not "known bad" -- simply not measured. Do not widen without a run.
+        assert effective_cache_ttl("1h", provider="opencode", model="qwen3.6-plus") == "5m"
+        assert effective_cache_ttl("1h", provider="opencode-zen", model="qwen3.6-plus") == "5m"
+
+    def test_ttl_allowlist_is_separate_from_cache_layout_optin(self):
+        """Regression guard for the trap in the original shared-set design.
+
+        ALIBABA_FAMILY_PROVIDERS drives the cache-marker-layout OPT-IN. Reusing
+        it for the TTL clamp means narrowing the clamp DISABLES caching instead
+        of extending its TTL.
+        """
+        from agent.prompt_caching import (
+            ALIBABA_FAMILY_PROVIDERS,
+            MEASURED_1H_PROVIDERS,
+        )
+
+        assert "opencode-go" in ALIBABA_FAMILY_PROVIDERS
+        assert "opencode-go" in MEASURED_1H_PROVIDERS
+        assert not (MEASURED_1H_PROVIDERS & {"alibaba"})
 
     def test_marker_built_from_clamped_ttl_has_no_1h_key(self):
         marker = _build_marker(effective_cache_ttl("1h", provider="opencode", model="qwen3.6-plus"))
