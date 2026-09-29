@@ -7,6 +7,7 @@ import contextlib
 import os
 import shutil
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -345,6 +346,33 @@ def _reap_socket_dir(socket_dir: str, session_name: str, tracked_names: set) -> 
     return reaped
 
 
+def _socket_dir_is_ours(socket_dir: str) -> bool:
+    """Ownership gate, applied before anything in a socket dir is trusted.
+
+    ``_reap_socket_dir`` reads a PID out of a file in this directory and tree-kills
+    it, and ``shutil.rmtree``s the directory. The directories live in
+    ``_socket_safe_tmpdir()`` — ``/tmp``, world-writable — and a dir with no
+    ``.owner_pid`` file is treated as a legacy daemon (reapable) rather than as
+    untrusted, so any local user who can ``mkdir`` there could choose the PID Hermes
+    kills. ``_verify_reapable_browser_daemon`` answers "does this PID look like a
+    browser daemon"; it cannot answer "is this directory even ours".
+
+    Skip anything this uid does not own, and never follow a symlink out of the temp
+    dir. Directories Hermes created are unaffected — it owns them. ``os.getuid`` is
+    POSIX-only; on Windows the per-user temp dir already provides this separation, so
+    the uid comparison is skipped there and the symlink check still applies.
+    """
+    _getuid = getattr(os, "getuid", None)
+    try:
+        st = os.lstat(socket_dir)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or (_getuid is not None and st.st_uid != _getuid()):
+        _bt.logger.debug("Skipping browser socket dir not owned by this uid: %s", socket_dir)
+        return False
+    return True
+
+
 def _reap_orphaned_browser_sessions():
     """Kill agent-browser daemons whose owning hermes process is gone (an unclean exit loses
     ``_active_sessions`` but node + Chromium keep running). Scans the tmp dir for
@@ -376,6 +404,8 @@ def _reap_orphaned_browser_sessions():
 
     reaped = 0
     for socket_dir in socket_dirs:
+        if not _socket_dir_is_ours(socket_dir):
+            continue
         session_name = os.path.basename(socket_dir).removeprefix("agent-browser-")
         if session_name and _reap_socket_dir(socket_dir, session_name, tracked_names):
             reaped += 1
