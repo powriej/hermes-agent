@@ -254,13 +254,29 @@ def cron_tick():
     # OSError means the tick failed outright. Both still count as the store having
     # been ATTENDED, which is what the heartbeat measures — so the heartbeat is
     # written either way and only the success marker is withheld.
+    def _beat(success: bool) -> None:
+        # Best-effort, matching the convention upstream uses for the sibling
+        # ``_write_owner_pid``. Without the suppression a heartbeat write that
+        # fails (disk full, permissions on a recreated ``cron/`` workspace) would
+        # propagate out of the ``finally`` and be caught by the ``except OSError``
+        # below — printing "Cron tick failed" and returning 1 for a tick that
+        # actually SUCCEEDED, and masking any real CronTickYielded/OSError on the
+        # way. A health signal must not be able to manufacture the failure it
+        # reports.
+        try:
+            record_ticker_heartbeat(success=success)
+        except Exception as exc:  # noqa: BLE001 — liveness write is never fatal
+            import logging
+            logging.getLogger(__name__).debug(
+                "Could not write cron ticker heartbeat: %s", exc)
+
     ok = False
     try:
         try:
             tick(verbose=True)
             ok = True
         finally:
-            record_ticker_heartbeat(success=ok)
+            _beat(ok)
     except CronTickYielded as exc:
         # Inert for a one-shot CLI (no boot fingerprint); report cleanly rather than traceback.
         print(color(f"✗ {exc}", Colors.YELLOW))
