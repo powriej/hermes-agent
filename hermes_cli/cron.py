@@ -440,12 +440,42 @@ def cron_status():
         if pids or gateway_alive_via_lock:
             _print_ticker_health(pids)
         else:
-            print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
-            print("\n  To enable automatic execution:\n"
-                  "    hermes gateway install    # Install as a user service\n"
-                  "    sudo hermes gateway install --system  "
-                  "# Linux servers: boot-time system service\n"
-                  "    hermes gateway            # Or run in foreground")
+            # No gateway drives THIS profile. That is the NORMAL, supported state for a
+            # profile ticked by an external systemd timer running
+            # ``hermes --profile X cron tick`` — the pattern used for profiles that share
+            # a Telegram bot token, where a gateway would seize it. Five profiles on this
+            # class of host are driven that way. Declaring cron dead purely because no
+            # gateway process exists is not merely uninformative: the remedy it then
+            # prints is ``hermes gateway install``, and for a token-sharing profile that
+            # is an actively harmful action. The heartbeat is written by whichever driver
+            # ticks the store, so trust it here.
+            from cron.jobs import (
+                TICKER_INTERVAL_SECONDS,
+                get_ticker_heartbeat_age,
+                get_ticker_success_age,
+            )
+
+            _stale_after = TICKER_INTERVAL_SECONDS * 3 + 20
+            _hb = get_ticker_heartbeat_age()
+            _ok = get_ticker_success_age()
+            if _hb is not None and _hb <= _stale_after:
+                print(color("✓ No gateway for this profile — cron is driven by an "
+                            "external ticker, and it is live", Colors.GREEN))
+                print(f"  Ticker heartbeat: {int(_hb)}s ago")
+                if _ok is not None and _ok > _stale_after:
+                    print(color(f"  ⚠ but no tick has SUCCEEDED in {int(_ok)}s — "
+                                "ticks may be failing.", Colors.YELLOW))
+            else:
+                print(color("✗ Gateway is not running — cron jobs will NOT fire", Colors.RED))
+                if _hb is not None:
+                    print(color(f"  (no ticker heartbeat for {int(_hb)}s either — if this "
+                                "profile is driven by a systemd timer rather than a "
+                                "gateway, check that timer, not the gateway.)", Colors.DIM))
+                print("\n  To enable automatic execution:\n"
+                      "    hermes gateway install    # Install as a user service\n"
+                      "    sudo hermes gateway install --system  "
+                      "# Linux servers: boot-time system service\n"
+                      "    hermes gateway            # Or run in foreground")
 
     print()
     _print_active_jobs_summary(list_jobs(include_disabled=False))
