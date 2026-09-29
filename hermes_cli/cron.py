@@ -237,8 +237,30 @@ def _job_warnings(job: Dict[str, Any]) -> List[str]:
 def cron_tick():
     """Run due jobs once and exit."""
     from cron.scheduler import CronTickYielded, tick
+    from cron.jobs import record_ticker_heartbeat
+
+    # A profile driven by an EXTERNAL ticker (a systemd timer running
+    # ``hermes --profile X cron tick`` every minute — the supported way to drive a
+    # profile whose gateway would seize a shared Telegram bot token) never enters
+    # the in-process scheduler loop in cron/scheduler_provider.py, which is the
+    # ONLY other caller of record_ticker_heartbeat(). Without this write the
+    # store's ticker_heartbeat never advances, so every heartbeat-based health
+    # check is permanently blind for exactly the profiles that have no gateway to
+    # fall back on. Record liveness here so the heartbeat means "this store was
+    # ticked", whichever driver did it.
+    #
+    # ``success`` is reserved for a tick that actually completed: a CronTickYielded
+    # means a fresher process owns the runtime lock and will do the work, and an
+    # OSError means the tick failed outright. Both still count as the store having
+    # been ATTENDED, which is what the heartbeat measures — so the heartbeat is
+    # written either way and only the success marker is withheld.
+    ok = False
     try:
-        tick(verbose=True)
+        try:
+            tick(verbose=True)
+            ok = True
+        finally:
+            record_ticker_heartbeat(success=ok)
     except CronTickYielded as exc:
         # Inert for a one-shot CLI (no boot fingerprint); report cleanly rather than traceback.
         print(color(f"✗ {exc}", Colors.YELLOW))
