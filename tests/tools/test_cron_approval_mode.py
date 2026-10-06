@@ -133,6 +133,29 @@ class TestCronContextVarDetection:
 
         assert result["approved"] is True
 
+    @pytest.mark.parametrize("cron_mode", ["deny", "approve"])
+    def test_live_gateway_turn_is_not_judged_by_cron_policy_for_execute_code(self, monkeypatch, cron_mode):
+        """A cron marker left on the process must not capture a live user's execute_code: under
+        cron policy it would be BLOCKED ("no user present") or, with cron_mode: approve, run
+        arbitrary local Python with no prompt at all. The turn's own binding wins."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")  # a cron job ran earlier in this process
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")  # set by the gateway at startup
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "manual")
+        monkeypatch.setattr(approval_context, "_get_cron_approval_mode", lambda: cron_mode)
+
+        # What every live turn binds (gateway, API server, TUI, ACP).
+        tokens = set_session_vars(platform="telegram", session_key="test-session", cron_session="")
+        try:
+            result = approval_module.check_execute_code_guard("import os; os.system('id')", "local")
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["approved"] is False
+        assert result.get("status") == "pending_approval"
+
 
 # ---------------------------------------------------------------------------
 # check_dangerous_command() with cron session
