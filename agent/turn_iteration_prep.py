@@ -14,7 +14,7 @@ import random
 import sys
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from agent.display import KawaiiSpinner
 from agent.interrupt_control import interrupt_issuer, interrupted_during_api_call_reason
@@ -149,7 +149,10 @@ def prepare_iteration(
     # break the prompt cache — same contract as apply_pending_steer_to_tool_results).
     _pre_api_steer = agent._drain_pending_steer()
     if _pre_api_steer:
-        _inject_steer_after_newest_tool_result(agent, messages, _pre_api_steer)
+        _inject_steer_after_newest_tool_result(
+            agent, messages, _pre_api_steer,
+            floor=_steer_scan_floor(messages, current_turn_user_idx, user_message),
+        )
 
     # One-shot run-budget wrap-up notice at 80% of agent.run_budget_seconds, appended to the
     # newest tool result; off with no budget.
@@ -259,10 +262,38 @@ def _previous_tool_round(messages: Any) -> list:
     return []
 
 
-def _inject_steer_after_newest_tool_result(agent: Any, messages: Any, steer_text: str) -> None:
+def _steer_scan_floor(messages: Any, current_turn_user_idx: Any, user_message: Any) -> Optional[int]:
+    """Index of this turn's user row, the lowest row the pre-API steer drain may scan; None when
+    the turn boundary is unknown. The drain runs before this iteration's re-anchor, so the
+    recorded index can be stale (mid-turn compaction, alternation repair): re-derive it from the
+    user text without touching agent state."""
+    if user_message is not None:
+        if _anchors_current_turn(messages, current_turn_user_idx, user_message):
+            return current_turn_user_idx
+        from agent.turn_context import reanchor_current_turn_user_idx
+        _idx = reanchor_current_turn_user_idx(messages, user_message)
+        return _idx if _idx >= 0 else None
+    _idx = current_turn_user_idx
+    if isinstance(_idx, int) and not isinstance(_idx, bool) and 0 <= _idx < len(messages):
+        _row = messages[_idx]
+        if isinstance(_row, dict) and _row.get("role") == "user":
+            return _idx
+    return None
+
+
+def _inject_steer_after_newest_tool_result(
+    agent: Any, messages: Any, steer_text: str, *, floor: Optional[int] = 0,
+) -> None:
     """Append the steer marker as a standalone user row after the newest tool message; with no
-    tool message, put the text back so the post-tool-execution drain delivers it later."""
-    for _si in range(len(messages) - 1, -1, -1):
+    tool message, put the text back so the post-tool-execution drain delivers it later.
+
+    ``floor`` bounds the scan at this turn's user row (None: boundary unknown, scan nothing).
+    On an iteration with no fresh tool batch (the turn's first response truncated or came back
+    empty and the loop re-entered) the newest tool row belongs to an EARLIER turn: landing the
+    steer there rewrites already-sent history (prompt-cache prefix, append-only durable order)
+    where the model will not act on it. Requeueing keeps it for this turn's first tool batch."""
+    _steer_floor = len(messages) if floor is None else max(0, floor)
+    for _si in range(len(messages) - 1, _steer_floor - 1, -1):
         _sm = messages[_si]
         if isinstance(_sm, dict) and _sm.get("role") == "tool":
             from agent.prompt_builder import steer_user_row
