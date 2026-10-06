@@ -53,6 +53,19 @@ def test_prepare_command_uses_selected_environment_for_nopasswd(monkeypatch):
     assert env._prepare_command("sudo true") == ("sudo true", None)
 
 
+def test_prepare_command_withholds_configured_password_when_backend_sudo_will_not_prompt(monkeypatch):
+    """The password line goes to the shell's stdin; a sudo that does not prompt leaves it for `cat`."""
+    monkeypatch.setenv("SUDO_PASSWORD", "hunter2")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    env = _TestableEnv()
+
+    monkeypatch.setattr(env, "_sudo_nopasswd_works", lambda: True)
+    assert env._prepare_command("sudo true; cat") == ("sudo true; cat", None)
+
+    monkeypatch.setattr(env, "_sudo_nopasswd_works", lambda: False)
+    assert env._prepare_command("sudo true; cat") == ("sudo -S -p '' true; cat", "hunter2\n")
+
+
 @pytest.mark.parametrize(
     ("supported", "returncode", "expected", "probed"),
     [(True, 0, True, True), (True, 1, False, True), (False, 0, False, False)],
