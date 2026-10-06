@@ -314,13 +314,21 @@ def cron_tick():
     from hermes_cli.observability.shared_metrics_process import begin_process
 
     begin_process("cron")
+    # An external one-shot ticker (a systemd timer running ``hermes -p X cron tick`` each minute)
+    # never enters the provider loop in cron/scheduler_provider.py, the only other heartbeat
+    # writer — so without this the store's liveness markers never advance for exactly the
+    # profiles that have no gateway to fall back on, and a tick that starts failing is invisible.
+    # The heartbeat means "this store was attended"; ``success`` only "the tick completed".
+    success = yielded = False
     try:
         tick(verbose=True)
+        success = True
     except CronTickYielded as exc:
         # Inert for a one-shot CLI (no boot fingerprint); report cleanly rather than traceback.
         print(color(f"✗ {exc}", Colors.YELLOW))
         print("  A fresher gateway process owns the runtime lock and will fire due jobs; this "
               "stale process yielded its tick.")
+        yielded = True
         return 1
     except OSError as exc:
         # Real lock-acquisition failures (EMFILE, EACCES) propagate; they are not contention.
@@ -329,6 +337,11 @@ def cron_tick():
         print(color(f"✗ Cron tick failed: {exc}", Colors.RED))
         print("  Check `hermes cron status` and the gateway log for details.")
         return 1
+    finally:
+        # Not on a yield: the fresher process that owns the store stamps its own (live) pid.
+        if not yielded:
+            from cron.jobs import record_ticker_heartbeat
+            record_ticker_heartbeat(success=success)
     return 0
 
 
