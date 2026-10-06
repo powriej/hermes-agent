@@ -2539,11 +2539,51 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
     )
 
 
+def _served_model_fields(requested_model, result, handed_model=None) -> dict:
+    """Split what a cron fire REQUESTED from what actually SERVED it.
+
+    Recording only the requested model lets a silent fallback hide a dead model: the audit keeps
+    saying "<dead model> ... ok" while another provider answers every call, until that one fails
+    too. ``result["model"]`` is ``agent.model`` read after the turn, so it reflects a mid-run
+    fallback; ``result["served_model"]`` (agent/served_model.py) is the routing proxy's deployment
+    when it reported one. ``handed_model`` is the model the agent was constructed with, which
+    already differs from ``requested_model`` after a pre-agent provider switch (#74349).
+
+    ``result`` may be None or a non-dict and its values need not be strings: an audit write must
+    never raise, and an unserialisable value would lose the whole row. ``fallback_used`` is only
+    claimed on evidence — the "unknown" signal is ``served_model`` being null, never a fabricated
+    False-means-fine.
+    """
+    def _s(value):
+        return value if isinstance(value, str) and value else None
+
+    r = result if isinstance(result, dict) else {}
+    requested, handed, active = _s(requested_model), _s(handed_model) or _s(requested_model), _s(r.get("model"))
+    asked = _s(r.get("requested_model")) or handed
+    return {
+        "served_model": _s(r.get("served_model")) or active,
+        "served_provider": _s(r.get("provider")),
+        "fallback_used": bool(
+            (requested and handed and requested != handed) or (active and asked and active != asked)),
+    }
+
+
+def _agent_model_snapshot(agent) -> dict:
+    """Model identity of a fire that raised: what the agent was on when it failed (a fallback that
+    then also died is still a fallback). Never raises."""
+    try:
+        from agent.served_model import result_model_fields
+        return {"model": agent.model, "provider": agent.provider, **result_model_fields(agent)}
+    except Exception:
+        return {}
+
+
 class _FireAudit:
     """One usage_audit.jsonl line per fire (created once the agent exists; fire id + start clock)."""
 
-    def __init__(self, job: dict, job_id: str, model: str):
+    def __init__(self, job: dict, job_id: str, model: str, requested_model: Optional[str] = None):
         self.job, self.job_id, self.model = job, job_id, model
+        self.requested_model = requested_model or model
         self.fire_id = uuid.uuid4().hex
         self.t_start = time.monotonic()
 
@@ -2558,6 +2598,8 @@ class _FireAudit:
             "response_silent": bool(result.get("response_silent")),
             "deliver_target": self.job.get("deliver"),
             "model": self.model or None,
+            "requested_model": self.requested_model or None,
+            **_served_model_fields(self.requested_model, result, self.model),
             "duration_ms": int((time.monotonic() - self.t_start) * 1000),
             "error": error})
 
@@ -2619,7 +2661,7 @@ def run_job(
         agent = _construct_cron_agent(
             AIAgent, job, _cfg, setup, workdir=scope.workdir, session_id=_cron_session_id,
             session_db=_session_db)
-        _audit = _FireAudit(job, job_id, model)
+        _audit = _FireAudit(job, job_id, model, requested_model=jc.model)
 
         result = _run_agent_with_watchdog(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
@@ -2665,7 +2707,7 @@ def run_job(
             logger.debug("Job '%s': unreachable-failure classification failed", job_id)
         # No audit row when we failed before the agent existed; the audit write must never raise.
         if _audit is not None:
-            _audit.write({}, error_msg)
+            _audit.write(_agent_model_snapshot(agent), error_msg)
         from cron.scheduler_diagnostics import format_run_error
         output = (
             _run_doc_header(job, f"{job_name} (FAILED)", job_id, prompt)
