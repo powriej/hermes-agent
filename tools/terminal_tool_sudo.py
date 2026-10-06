@@ -320,11 +320,12 @@ def _scan_shell(command: str, background: bool = False) -> Iterator[tuple[str, i
         i = end
 
 
-def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
+def _rewrite_real_sudo_invocations(command: str, sudo_ends: list[int] | None = None) -> tuple[str, int]:
     """Rewrite literal sudo executable words, preserving their spelling and arguments.
 
     Follow ordinary env options/assignments, not shell payloads or env split strings:
     interpreting those requires a second parser and rewriting inside another quoting layer.
+    ``sudo_ends`` collects the offset just past each sudo word (see ``_sudo_never_prompts``).
     """
     out: list[str] = []
     sudo_count = 0
@@ -376,7 +377,57 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
         if executable == "sudo":
             out[-1] += " -S -p ''"
             sudo_count += 1
+            if sudo_ends is not None:
+                sudo_ends.append(end)
     return "".join(out), sudo_count
+
+
+# sudo's own options that take a value: as the next word, or attached to the short form (-uroot).
+_SUDO_VALUE_FLAGS = "CDghpRrtTUu"
+_SUDO_VALUE_OPTIONS = frozenset({
+    "--close-from", "--chdir", "--group", "--host", "--prompt", "--chroot", "--role", "--type",
+    "--command-timeout", "--other-user", "--user",
+})
+
+
+def _sudo_never_prompts(command: str, sudo_ends: list[int]) -> bool:
+    """True when a real sudo word in *command* carries ``-n`` / ``--non-interactive``.
+
+    Such a sudo fails instead of prompting, so it reads nothing from stdin, and the password
+    line (which sits on the SHELL's stdin, not sudo's) is left for whatever reads next:
+    ``sudo -n true; cat`` hands it straight back as tool output. No backend probe can see this;
+    it is a property of the command. Only sudo's own option cluster is read, so the ``-n`` in
+    ``sudo apt-get install -n foo`` or the value in ``sudo -u nobody`` does not count.
+    """
+    for sudo_end in sudo_ends:
+        value_pending = False
+        for kind, start, end, _ in _scan_shell(command[sudo_end:]):
+            text = command[sudo_end + start:sudo_end + end]
+            if kind == "op" or text == "\n":
+                break
+            if kind != "word":
+                continue
+            try:
+                (option,) = shlex.split(text)
+            except ValueError:
+                break
+            if value_pending:
+                value_pending = False
+                continue
+            if not option.startswith("-") or option in {"-", "--"}:
+                break  # sudo's options ended: this is the command it runs
+            if option.startswith("--"):
+                if option == "--non-interactive":
+                    return True
+                value_pending = option in _SUDO_VALUE_OPTIONS
+                continue
+            for index, flag in enumerate(option[1:], start=2):
+                if flag == "n":
+                    return True
+                if flag in _SUDO_VALUE_FLAGS:
+                    value_pending = index == len(option)  # else the value is attached
+                    break
+    return False
 
 
 def _count_real_sudo_invocations(command: str) -> int:
@@ -460,12 +511,14 @@ def _transform_sudo_command(
     is required". Password sources, in order: configured SUDO_PASSWORD, the session cache, then
     an interactive prompt (45s timeout, cached on success) when a UI is reachable.
     ``sudo_nopasswd_check`` (supplied by ``BaseEnvironment``) runs ``sudo -n true`` inside the
-    selected backend; a True result skips the prompt and the ``-S`` rewrite entirely."""
+    selected backend; a True result skips the prompt and the ``-S`` rewrite entirely, as does a
+    ``sudo -n`` in the command itself (``_sudo_never_prompts``)."""
     from tools.terminal_tool import _get_sudo_password_callback
     if command is None:
         return None, None
-    transformed, sudo_count = _rewrite_real_sudo_invocations(command)
-    if sudo_count == 0:
+    sudo_ends: list[int] = []
+    transformed, sudo_count = _rewrite_real_sudo_invocations(command, sudo_ends)
+    if sudo_count == 0 or _sudo_never_prompts(command, sudo_ends):
         return command, None
 
     # Scope-aware read: under multiplex the process env may hold another profile's SUDO_PASSWORD;
@@ -484,13 +537,17 @@ def _transform_sudo_command(
     should_prompt_for_sudo = (
         env_var_enabled("HERMES_INTERACTIVE") or _get_sudo_password_callback() is not None
     ) and not _no_sudo_user()
-    if not has_configured_password and not sudo_password and should_prompt_for_sudo:
-        # sudoers NOPASSWD must not be forced through the prompt or the -S pipe. The probe is
-        # a round trip on the selected backend (an ssh exec for SSH), so it only runs when a
-        # prompt would otherwise fire: headless callers end up at ``(command, None)`` either
-        # way. Re-probed every call so an expired sudo timestamp cannot silently block.
-        if sudo_nopasswd_check is not None and sudo_nopasswd_check():
-            return command, None
+    have_password = has_configured_password or bool(sudo_password)
+    # A sudo that will not prompt (sudoers NOPASSWD, a live sudo timestamp) must not be forced
+    # through the prompt, and must not be sent a password line either: unread, that line stays on
+    # the shell's stdin and the next reader in the command (`sudo true && cat`) returns the
+    # password as tool output. So the probe runs whenever a line would be piped, configured and
+    # cached passwords included. It is a round trip on the selected backend (an ssh exec for SSH),
+    # skipped only for headless callers with no password, who end up at ``(command, None)`` either
+    # way. Re-probed every call so an expired sudo timestamp cannot silently block.
+    if (have_password or should_prompt_for_sudo) and sudo_nopasswd_check is not None and sudo_nopasswd_check():
+        return command, None
+    if not have_password and should_prompt_for_sudo:
         sudo_password = _prompt_for_sudo_password(timeout_seconds=45, command=command)
         if sudo_password:
             _set_cached_sudo_password(sudo_password)

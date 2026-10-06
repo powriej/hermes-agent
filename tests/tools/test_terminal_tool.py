@@ -122,3 +122,92 @@ def test_sudo_rewrite_preserves_env_operands_and_prose(monkeypatch):
 def test_count_real_sudo_invocations_ignores_mentions(monkeypatch):
     assert terminal_tool_sudo._count_real_sudo_invocations("grep sudo README.md") == 0
     assert terminal_tool_sudo._count_real_sudo_invocations("sudo a; sudo b") == 2
+
+
+# ── the sudo password must never land where sudo won't read it ──────────────
+# sudo_stdin goes to the SHELL's stdin, not sudo's. ``sudo -S`` consumes exactly one line and
+# only when it actually prompts; otherwise the line falls through to the next reader in the
+# command and the operator's password comes back as tool output.
+
+_PROMPTS = {"sudo_nopasswd_check": lambda: False}
+_NEVER_PROMPTS = {"sudo_nopasswd_check": lambda: True}
+
+
+def test_non_prompting_backend_gets_no_password_line_even_when_configured(monkeypatch):
+    """NOPASSWD sudoers or a live sudo timestamp: sudo reads nothing, so `cat` would echo it."""
+    monkeypatch.setenv("SUDO_PASSWORD", "hunter2")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    assert terminal_tool_sudo._transform_sudo_command("sudo true && cat", **_NEVER_PROMPTS) == (
+        "sudo true && cat", None)
+
+
+def test_non_prompting_backend_gets_no_cached_password_line(monkeypatch):
+    """An interactively entered password is cached; the timestamp it just warmed means no prompt."""
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    terminal_tool_sudo._set_cached_sudo_password("hunter2")
+
+    assert terminal_tool_sudo._transform_sudo_command("sudo true; cat", **_NEVER_PROMPTS) == (
+        "sudo true; cat", None)
+
+
+def test_noninteractive_sudo_never_receives_a_password_line(monkeypatch):
+    """`sudo -n` fails instead of prompting, whatever the host's sudo state: a property of the command."""
+    monkeypatch.setenv("SUDO_PASSWORD", "hunter2")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    for command in (
+        "sudo -n true; cat",
+        "sudo --non-interactive true; cat",
+        "sudo -kn true; cat",
+        "sudo -p 'pw: ' -n true; cat",
+        "sudo -u root -n true; cat",
+        "sudo --user root -n true; cat",
+        "sudo --user=root -n true; cat",
+        "sudo -uroot -n true; cat",
+        "/usr/bin/sudo -n true; cat",
+        "env FOO=1 sudo -n true; cat",
+        "true && sudo -n true | cat",
+        "sudo apt-get update && sudo -n true; cat",
+    ):
+        assert terminal_tool_sudo._transform_sudo_command(command, **_PROMPTS) == (command, None), command
+
+
+def test_noninteractive_sudo_is_not_prompted_for_interactively(monkeypatch):
+    """Prompting the user for a password that `sudo -n` will never read is how it would leak."""
+    monkeypatch.delenv("SUDO_PASSWORD", raising=False)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+    def _fail_prompt(*_args, **_kwargs):
+        raise AssertionError("sudo -n must not trigger the interactive password prompt")
+
+    monkeypatch.setattr(terminal_tool_sudo, "_prompt_for_sudo_password", _fail_prompt)
+
+    assert terminal_tool_sudo._transform_sudo_command("sudo -n true; cat", **_PROMPTS) == (
+        "sudo -n true; cat", None)
+
+
+def test_prompting_sudo_still_receives_its_password(monkeypatch):
+    monkeypatch.setenv("SUDO_PASSWORD", "hunter2")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    assert terminal_tool_sudo._transform_sudo_command("sudo apt-get update", **_PROMPTS) == (
+        "sudo -S -p '' apt-get update", "hunter2\n")
+    # One line per invocation is preserved for compound commands.
+    assert terminal_tool_sudo._transform_sudo_command("sudo a && sudo b", **_PROMPTS)[1] == "hunter2\nhunter2\n"
+
+
+def test_n_that_is_not_sudos_own_flag_does_not_withhold_the_password(monkeypatch):
+    monkeypatch.setenv("SUDO_PASSWORD", "hunter2")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+
+    for command in (
+        "sudo apt-get install -n foo",   # the child command's flag
+        "sudo tar -xn archive",
+        "sudo -u nobody true",           # an option VALUE containing "n"
+        "sudo -unobody true",
+        "sudo -g nogroup -- ls -n",
+        "sudo true; echo sudo -n",       # prose after a real sudo
+    ):
+        assert terminal_tool_sudo._transform_sudo_command(command, **_PROMPTS)[1] == "hunter2\n", command
