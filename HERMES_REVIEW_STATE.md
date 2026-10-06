@@ -161,3 +161,39 @@ whenever it is revisited:
   that should have prevented it"), so it would go through the private security channel rather
   than a plain PR. The cron approval issue is a functional/trust-model defect, not a §3.1
   vulnerability, and belongs in a normal PR.
+
+---
+
+## 6. Re-derivation onto `1212a7f18c` (2026-10-06)
+
+The carry was rebuilt as `carry/hermes-local-20261006` on upstream `1212a7f18c`, which is
+14 commits short of `origin/main` @ `65bc6727b4` ON PURPOSE: the next two upstream commits
+(`68dd992769`, `911da42e9e`) delete the bundled tirith pre-exec scanner, and config v50 drops
+`security.tirith_*`. The johnny5 profile pins its own tirith binary with
+`tirith_fail_open: false` as a fail-closed safeguard. At `68dd992769` alone that profile would
+block every terminal command (scanner un-importable, fail-closed); from `911da42e9e` on it
+would run with no scanner at all. Advancing past `1212a7f18c` is an operator decision: carry a
+revert of both commits, or accept the loss of the scanner. The fixes were first re-derived on
+`65bc6727b4` and then rebased here without conflict. Every previously carried fix was
+re-derived against current code, not ported by line anchor.
+
+| Original | Finding | Outcome |
+|---|---|---|
+| `d057999212` | `--include-integration` selects nothing | carried (clean cherry-pick) |
+| `fb48247711` | browser reaper touches foreign socket dirs | carried (clean cherry-pick) |
+| `f95a9c65f0` | sudo password handed to a shell that won't read it (P1) | **carried, re-implemented** in `tools/terminal_tool_sudo.py` (`_sudo_never_prompts`) |
+| `aa9b129cb7` | no ticker heartbeat from one-shot `cron tick` | **carried, re-implemented**; no heartbeat on `CronTickYielded` |
+| `905b266731` | `cron status` calls an externally ticked profile dead | **carried, new mechanism**: `cron/ticker_external` marker, `record_external_tick`, `_external_ticker_is_live` |
+| `f5a61db54f` | usage audit records requested, not served, model | **carried, re-implemented** (`_served_model_fields`) |
+| `26c544096` | steer injected into a previous turn (HCR-016) | **carried, re-implemented** (`_steer_scan_floor` in `agent/turn_iteration_prep.py`) |
+| `7822b7c7b5` | cron policy judges live gateway users (P2) | fixed upstream (per-job ContextVar, `_CronRunScope`); regression test added |
+| `56a68c0af` | iteration-summary request left as unanswered tail (HCR-014) | harmful outcome fixed upstream (`_close_transcript_tail`); the row is still persisted; test added |
+| `da6e3a6ab3` | failed heartbeat write masquerades as failed tick | fixed upstream (`_write_marker` swallows) ; guard test rides with the heartbeat commit |
+| `c9849458cc` | gateway PIDs attributed to the wrong profile | fixed upstream (#98790) |
+| `c36d87bd6` | MCP may killpg its own group (HCR-012) | fixed upstream at every use site; own pgid is still recorded |
+| `3019c111f9` | opencode-go 1h cache TTL clamped | fixed upstream (`MEASURED_1H_PROVIDERS`), patch-id equivalent |
+| `4a917bd71e` | CI durations merge drops slices | obsolete (workflow redesigned) |
+
+Known limits of the sudo fix (shared-stdin design, not closed): compound `sudo a; sudo b; cat`
+on a prompting host, a command that starves sudo of stdin, and sudoers that grant NOPASSWD to
+the target but not to `true`. It is a guard against accident, not containment.
