@@ -1313,6 +1313,20 @@ def get_ticker_success_age() -> Optional[float]:
     return _epoch_file_age("ticker_last_success")
 
 
+def record_external_tick() -> None:
+    """Mark this store as attended by a one-shot ``hermes cron tick`` (e.g. a systemd timer).
+
+    Such a ticker exits after every tick, so the pid in ``ticker_heartbeat`` is always dead by the
+    time anyone reads it and ``ticker_heartbeat_writer_alive()`` can never vouch for it. This marker
+    is the external ticker's own proof: fresh = a one-shot tick ran within the staleness window."""
+    _write_marker("ticker_external", str(time.time()), ".hb_")
+
+
+def get_external_tick_age() -> Optional[float]:
+    """Seconds since a one-shot ``hermes cron tick`` last attended this store, or None (never)."""
+    return _epoch_file_age("ticker_external")
+
+
 def get_catch_up_occurrence_count() -> int:
     """Return the profile-local stale-schedule catch-up count."""
     path = _current_cron_store().cron_dir / "catch_up_occurrences"

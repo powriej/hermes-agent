@@ -75,7 +75,9 @@ def _builtin_gateway_liveness() -> Optional[bool]:
 
 def _warn_if_gateway_not_running() -> None:
     """Warn at create/list time when the scheduler is not ready; stay silent on an unknown probe result."""
-    if _builtin_gateway_liveness() is not False:
+    # A profile ticked by an external one-shot ticker has no gateway by design: its jobs fire, and
+    # "hermes gateway install" is the wrong remedy for it.
+    if _builtin_gateway_liveness() is not False or _external_ticker_is_live():
         return
     from hermes_cli.profiles import get_active_profile_name
     # Name the inspected profile: the shared gateway may well be running and ticking ANOTHER
@@ -340,8 +342,9 @@ def cron_tick():
     finally:
         # Not on a yield: the fresher process that owns the store stamps its own (live) pid.
         if not yielded:
-            from cron.jobs import record_ticker_heartbeat
+            from cron.jobs import record_external_tick, record_ticker_heartbeat
             record_ticker_heartbeat(success=success)
+            record_external_tick()
     return 0
 
 
@@ -421,6 +424,31 @@ _FD_EXHAUSTION_HINT = ("  Hint: the ticker hit file-descriptor exhaustion (EMFIL
 def _ticker_age_is_fresh(age: Optional[float]) -> bool:
     from cron.jobs import TICKER_INTERVAL_SECONDS
     return age is not None and age <= TICKER_INTERVAL_SECONDS * 3 + 20
+
+
+def _external_ticker_is_live() -> bool:
+    """True when a one-shot ``hermes cron tick`` (e.g. a systemd timer) attended THIS store within
+    the staleness window. That is a supported way to drive a profile with no gateway at all."""
+    try:
+        from cron.jobs import get_external_tick_age
+        return _ticker_age_is_fresh(get_external_tick_age())
+    except Exception:
+        return False
+
+
+def _print_external_ticker_health(active: str) -> None:
+    """Report a profile driven by an external one-shot ticker: no gateway is expected, so neither
+    "not running" nor a `gateway install` remedy applies. Still say so when ticks are failing."""
+    from cron.jobs import get_ticker_heartbeat_age, get_ticker_success_age
+    hb_age, ok_age = get_ticker_heartbeat_age(), get_ticker_success_age()
+    print(color(f"✓ No gateway for profile '{active}' — cron is driven by an external ticker "
+                "(`hermes cron tick`), and it is live", Colors.GREEN))
+    if hb_age is not None:
+        print(f"  Ticker heartbeat: {int(hb_age)}s ago")
+    if not _ticker_age_is_fresh(ok_age):
+        print(color("  ⚠ but no tick has succeeded "
+                    f"{'in ' + str(int(ok_age)) + 's' if ok_age is not None else 'yet'} "
+                    "— ticks may be failing. Check the timer's log.", Colors.YELLOW))
 
 
 def _print_ticker_health(pids: list, restart_command: str = "hermes gateway restart") -> None:
@@ -514,6 +542,7 @@ def cron_status():
         gateway_alive_via_lock = False
         served_by_multiplexer = False
         in_process_ticker = False
+        external_ticker = False
         if host is None and not pids:
             # The pid scan transiently misses a live gateway right after a restart; the runtime
             # lock proves the process is alive. Declare "not running" only when both agree.
@@ -535,6 +564,7 @@ def cron_status():
                     from cron.jobs import get_ticker_heartbeat_age, ticker_heartbeat_writer_alive
                     in_process_ticker = (_ticker_age_is_fresh(get_ticker_heartbeat_age())
                                          and ticker_heartbeat_writer_alive())
+                external_ticker = not in_process_ticker and _external_ticker_is_live()
         if host is not None:
             print(f"  Scheduler host: {host.describe()}")
             # `hermes gateway restart` exits 78 for a served NAMED profile
@@ -555,6 +585,8 @@ def cron_status():
                 _print_ticker_health([], restart_command="restart the Hermes Desktop app (or its serve backend)")
             else:
                 _print_ticker_health(pids)
+        elif external_ticker:
+            _print_external_ticker_health(active)
         else:
             # Only THIS profile's scheduler is knowable from here: a gateway may be alive on the
             # host ticking other profiles, so never assert a host-wide negative (#99579).
@@ -568,6 +600,15 @@ def cron_status():
                     print(color("  Scheduler last ticked "
                                 f"{_format_lateness(hb_age)} ago — jobs that came due "
                                 "since then have not fired.", Colors.YELLOW))
+            with contextlib.suppress(Exception):
+                from cron.jobs import get_external_tick_age
+                ext_age = get_external_tick_age()
+                if ext_age is not None:
+                    # The remedy below is wrong for a timer-driven profile (a gateway there can
+                    # seize a shared bot token): point at the timer first.
+                    print(color("  This profile was last driven by an external ticker (`hermes cron tick`) "
+                                f"{_format_lateness(ext_age)} ago — if a systemd timer or similar drives "
+                                "it, check that timer, not the gateway.", Colors.YELLOW))
             print("\n  Start the ONE host gateway (it multiplexes every profile, this one included):\n"
                   "    hermes --profile default gateway install   # user service\n"
                   "    sudo hermes --profile default gateway install --system  # Linux servers: boot-time service\n"
