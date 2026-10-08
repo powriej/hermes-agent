@@ -296,3 +296,83 @@ def test_the_watch_settles_after_the_drain_wrote_its_outcome(tmp_path, monkeypat
     # Hosts whose SQLite runs the queue in WAL mode write to the -wal file first.
     (tmp_path / "deliveries.db-wal").write_bytes(b"frame")
     assert watch.changed() is True
+
+
+def _optin_harness(tmp_path, monkeypatch, *, wanted, gate=lambda name, home: True, tick_homes=None):
+    """One housekeeping tick on a STANDALONE gateway, recording which homes were drained."""
+    root_adapters = {"telegram": object()}
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False),
+        adapters=root_adapters, _profile_adapters={}, _primary_profile_name="infra",
+    )
+    homes = tick_homes or [("infra", tmp_path / "infra"), ("research", tmp_path / "research"),
+                           ("offroad", tmp_path / "offroad"), ("johnny5", tmp_path / "johnny5")]
+    calls = []
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: tmp_path / "infra")
+    monkeypatch.setattr(gateway_run, "_handoff_watch_scopes", lambda _runner: [(None, None)])
+    monkeypatch.setattr(gateway_run, "_cron_tick_profile_homes", lambda _config: homes)
+    monkeypatch.setattr(gateway_run, "_cron_profile_gate", gate)
+    import hermes_cli.config as hermes_config
+    monkeypatch.setattr(hermes_config, "load_config_readonly",
+                        lambda: {"cron": {"drain_profile_queues": wanted}})
+
+    @contextmanager
+    def fake_scope(home):
+        calls.append(("scope", home))
+        yield
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_scope)
+    from gateway import run_profile_reconcile
+    monkeypatch.setattr(run_profile_reconcile, "_mcp_config_reconciler", lambda runner: lambda: None)
+    monkeypatch.setattr(run_profile_reconcile, "_for_each_served_profile", lambda runner, body: None)
+    monkeypatch.setattr(scheduler, "drain_delivery_queue",
+                        lambda adapters, loop: calls.append(("drain", adapters)))
+    gateway_run._start_gateway_housekeeping(
+        _OneTickStopEvent(), adapters=root_adapters, loop=object(), interval=0, runner=runner)
+    drained = [home.name for kind, home in calls if kind == "scope"]
+    return drained, calls, root_adapters
+
+
+def test_standalone_gateway_drains_an_opted_in_profile_it_ticks(tmp_path, monkeypatch):
+    drained, calls, root_adapters = _optin_harness(tmp_path, monkeypatch, wanted=["research"])
+    assert drained == ["infra", "research"]
+    # ...and through THIS gateway's adapters, which is the whole meaning of the opt-in.
+    assert [a for kind, a in calls if kind == "drain"] == [root_adapters, root_adapters]
+
+
+def test_standalone_gateway_leaves_unlisted_profiles_queued(tmp_path, monkeypatch):
+    """The default. A second standalone gateway loading this code must change nothing."""
+    drained, _calls, _ = _optin_harness(tmp_path, monkeypatch, wanted=[])
+    assert drained == ["infra"]
+    drained, _calls, _ = _optin_harness(tmp_path, monkeypatch, wanted=["research"])
+    assert "offroad" not in drained and "johnny5" not in drained
+
+
+def test_opted_in_profile_with_its_own_live_gateway_is_not_drained(tmp_path, monkeypatch):
+    """Listing a profile is not enough: while its own gateway is alive, that gateway owns the queue."""
+    drained, _calls, _ = _optin_harness(
+        tmp_path, monkeypatch, wanted=["research", "johnny5"],
+        gate=lambda name, home: name != "johnny5")
+    assert drained == ["infra", "research"]
+
+
+def test_one_broken_opted_in_queue_does_not_stop_the_next(tmp_path, monkeypatch):
+    root_adapters = {"telegram": object()}
+    runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False), adapters=root_adapters,
+                             _profile_adapters={}, _primary_profile_name="infra")
+    seen = []
+    monkeypatch.setattr(gateway_run, "_cron_drain_optin_homes",
+                        lambda _runner: [("research", tmp_path / "research"), ("offroad", tmp_path / "offroad")])
+    monkeypatch.setattr(gateway_run, "_handoff_watch_scopes", lambda _runner: [])
+
+    @contextmanager
+    def fake_scope(home):
+        seen.append(home.name)
+        if home.name == "research":
+            raise RuntimeError("queue unreadable")
+        yield
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_scope)
+    monkeypatch.setattr(scheduler, "drain_delivery_queue", lambda adapters, loop: None)
+    gateway_run._drain_restart_safe_cron_deliveries(root_adapters, object(), runner)
+    assert seen == ["research", "offroad"]

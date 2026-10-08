@@ -4719,6 +4719,47 @@ def _housekeeping_checkpoint_prune() -> None:
     auto_prune_from_config()
 
 
+def _cron_drain_optin_homes(runner: object) -> list:
+    """``(name, home)`` of UNSERVED profiles whose worker delivery queue this gateway drains, by
+    explicit opt-in: ``cron.drain_profile_queues`` in the LAUNCH profile's config, default empty.
+
+    Why it exists: the in-process ticker fires every profile's jobs whatever ``multiplex_profiles``
+    says (``_cron_tick_profile_homes``), each in a restart-safe worker that queues its send for a
+    gateway to perform -- but the drain only visited SERVED profiles. On a standalone gateway that
+    left every other profile's output ``pending`` forever while the run was recorded delivered.
+
+    Why it is opt-in and not "every home I tick": a queued send goes out through THIS gateway's
+    adapters, i.e. this gateway's bot. That is right only for profiles that share its bot, which
+    nothing here can infer; a second standalone gateway ticking the same profiles must not start
+    delivering their output through a different bot the day it loads this code.
+
+    A listed profile is skipped while its own gateway is alive (``_cron_profile_gate``) -- that
+    gateway drains its own queue -- and when it is already served (multiplex) or is the launch
+    profile, whose queue the root scope drains.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        wanted = (load_config_readonly().get("cron") or {}).get("drain_profile_queues") or []
+        if not isinstance(wanted, (list, tuple)) or not wanted:
+            return []
+        wanted = {str(name) for name in wanted}
+        config = getattr(runner, "config", None)
+        served = {name for name, _home in _handoff_watch_scopes(runner) if name}
+        primary = getattr(runner, "_primary_profile_name", None)
+        out = []
+        for name, home in _cron_tick_profile_homes(config):
+            if name not in wanted or name in served or name == primary or home is None:
+                continue
+            if not _cron_profile_gate(name, home):
+                continue
+            out.append((name, home))
+        return out
+    except Exception:
+        logger.debug("Could not resolve cron.drain_profile_queues", exc_info=True)
+        return []
+
+
 def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
     """Drain each profile's worker queue through its matching live adapters. A credential-less satellite
     profile (empty adapter map) drains through the primary's adapters routed by its own profile routes."""
@@ -4742,6 +4783,14 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
                 if routes:
                     profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
             cron_scheduler.drain_delivery_queue(profile_adapters, loop)
+    # Opted-in unserved profiles: same drain, through this gateway's own adapters. One profile's
+    # broken queue must not stop the others.
+    for profile_name, profile_home in _cron_drain_optin_homes(runner):
+        try:
+            with _profile_runtime_scope(profile_home):
+                cron_scheduler.drain_delivery_queue(adapters, loop)
+        except Exception:
+            logger.warning("Cron delivery drain failed for opted-in profile %s", profile_name, exc_info=True)
 
 
 def _start_gateway_housekeeping(
@@ -4797,7 +4846,10 @@ def _start_gateway_housekeeping(
     queue_watch = None
     if adapters is not None or runner is not None:
         def served_homes() -> list:
-            return [home for _name, home in _handoff_watch_scopes(runner)] if runner is not None else [None]
+            if runner is None:
+                return [None]
+            return ([home for _name, home in _handoff_watch_scopes(runner)]
+                    + [home for _name, home in _cron_drain_optin_homes(runner)])
 
         queue_watch = DeliveryQueueWatch(
             served_homes, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner))
