@@ -197,3 +197,25 @@ re-derived against current code, not ported by line anchor.
 Known limits of the sudo fix (shared-stdin design, not closed): compound `sudo a; sudo b; cat`
 on a prompting host, a command that starves sudo of stdin, and sudoers that grant NOPASSWD to
 the target but not to `true`. It is a guard against accident, not containment.
+
+## 7. After the unpin (2026-10-06 19:01) — §6 no longer describes the install
+
+§6 is history. The pin at `1212a7f18c` ended the same evening: the install moved to
+`carry/hermes-local-next`, the same carried commits on upstream `ee8dd6c886`
+(`~/infra/scripts/hermes-unpin-cutover.sh`; reflog `HEAD@{2026-10-06 19:01:00}`). Both
+scanner-deletion commits (`68dd992769`, `911da42e9e`) are ancestors of that base, so there is no
+in-core tirith scanner on the execution path. Its replacement is a `pre_tool_call` shell hook,
+`~/.hermes/tirith-hook/tirith_guard.py`, configured per profile. As measured 2026-10-10 it runs
+with `--on-error block` for johnny5 and `--on-error allow` — fail-open — for the other seven
+profiles and the root config.
+
+Carried since §6:
+
+| Commit | Finding | Outcome |
+|---|---|---|
+| `3107530a5d` | A standalone gateway fires every profile's cron jobs but drained only its own delivery queue; other profiles' output stayed pending while the run was recorded delivered | **carried**: opt-in `cron.drain_profile_queues` in the launch profile's config (`gateway/run.py`). Background: `~/infra/docs/reports/infra-agent-review-20261006/REVIEW.md` §11 |
+| this commit's parent | Langfuse plugin released the root span's context from a different contextvars Context: two `Failed to detach context` ERROR tracebacks per trace, 304 of 326 ERROR records fleet-wide over 2026-10-08..10. Exported span data was not affected | **carried**: context entered and released in the same call (`plugins/observability/langfuse/__init__.py`). Background: `~/infra/docs/reports/admin-agent-review-20261010/HANDOFF.md` |
+
+Run the suite from a clone outside `~/.hermes`, not from a worktree of the install: in a
+worktree, `tests/home_io_guard.py` rejects the gitdir under `~/.hermes/hermes-agent/.git` and
+four `TestSystemPromptCrossesHookBoundary` tests fail for that reason alone.
