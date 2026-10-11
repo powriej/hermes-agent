@@ -2259,3 +2259,103 @@ class TestCanonicalCostExport:
         # explicit zeros are treated as authoritative by Langfuse and block
         # its own model-based estimation (#43129).
         assert response_cost == {}
+
+
+# ---------------------------------------------------------------------------
+# Root context unwinding: hook callbacks do not share a contextvars Context,
+# so the root observation's "current span" attachment must be released by the
+# callback that made it. Releasing it at finish time, from another Context,
+# makes OpenTelemetry log "Failed to detach context" (with a traceback) twice
+# per trace -- measured as the dominant ERROR class in every profile's
+# errors.log on a live estate.
+# ---------------------------------------------------------------------------
+
+class TestRootContextUnwoundWhereAttached:
+    _START = dict(task_id="t", session_id="sess-ctx", platform="cli", provider="p", model="m",
+                  api_mode="chat", messages=[{"role": "user", "content": "hi"}])
+
+    def _fresh_plugin(self):
+        mod_name = "plugins.observability.langfuse"
+        sys.modules.pop(mod_name, None)
+        return importlib.import_module(mod_name)
+
+    @staticmethod
+    def _in_thread(fn):
+        import threading
+        box: dict = {}
+
+        def run():
+            try:
+                box["value"] = fn()
+            except BaseException as exc:  # surfaced to the test thread below
+                box["error"] = exc
+
+        t = threading.Thread(target=run)
+        t.start()
+        t.join()
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def test_root_context_is_released_in_the_context_that_attached_it(self):
+        """A ContextVar token may only be reset in the Context that created it."""
+        import contextvars
+        mod = self._fresh_plugin()
+        current = contextvars.ContextVar("current_span", default=None)
+        failures: list = []
+        exits: list = []
+        ended: list = []
+
+        class _Span:
+            def update(self, **kw): pass
+            def update_trace(self, **kw): pass
+            def end(self, **kw): ended.append(1)
+
+        class _RootCM:
+            def __enter__(self):
+                self._token = current.set("root")
+                return _Span()
+            def __exit__(self, *exc):
+                exits.append(exc)
+                try:
+                    current.reset(self._token)
+                except ValueError as err:  # what OpenTelemetry logs as "Failed to detach context"
+                    failures.append(err)
+                return False
+
+        class _Client:
+            def create_trace_id(self, seed=None): return f"trace::{seed}"
+            def start_as_current_observation(self, **kw):
+                assert kw.get("end_on_exit") is False, "releasing the context must not end the root span"
+                return _RootCM()
+
+        state = self._in_thread(lambda: mod._start_root_trace("k", client=_Client(), **self._START))
+        assert not ended, "the root span must stay open until the trace is finished"
+        self._in_thread(lambda: mod._end_root(state, "root end()"))
+
+        assert not failures, f"root context released from a different Context: {failures[0]}"
+        assert len(exits) == 1, "the root context manager must be unwound exactly once"
+        assert ended == [1]
+
+    def test_real_sdk_logs_no_detach_error_and_keeps_session_grouping(self, caplog):
+        """Same seam against the pinned SDK: no detach error, and the root still exports as the
+        trace root with its session id, trace name and tags."""
+        langfuse = pytest.importorskip("langfuse")
+        mod = self._fresh_plugin()
+        client = langfuse.Langfuse(public_key="pk-lf-test", secret_key="sk-lf-test",
+                                   host="http://127.0.0.1:9", tracing_enabled=True)
+        with caplog.at_level(logging.ERROR, logger="opentelemetry.context"):
+            state = self._in_thread(lambda: mod._start_root_trace("k", client=client, **self._START))
+            assert state.root_span._otel_span.end_time is None, "releasing the context ended the root span"
+            self._in_thread(lambda: mod._end_root(state, "root end()"))
+        detach = [r for r in caplog.records if r.name == "opentelemetry.context"]
+        assert not detach, f"{len(detach)} x {detach[0].getMessage()}"
+
+        span = state.root_span._otel_span
+        assert span.end_time is not None
+        assert format(span.get_span_context().trace_id, "032x") == state.trace_id
+        attrs = dict(span.attributes)
+        assert attrs.get("session.id") == "sess-ctx"
+        assert attrs.get("langfuse.trace.name") == "Hermes turn"
+        assert tuple(attrs.get("langfuse.trace.tags") or ()) == ("hermes", "langfuse")
+        assert attrs.get("langfuse.internal.as_root") is True
